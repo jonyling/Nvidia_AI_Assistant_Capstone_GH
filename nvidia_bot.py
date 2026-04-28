@@ -5,9 +5,9 @@ import telebot
 from dotenv import load_dotenv
 import joblib
 import pandas as pd
-from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
+from datetime import datetime
 
+# LangChain
 from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -20,10 +20,20 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+if not BOT_TOKEN or not CHAT_ID:
+    raise ValueError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in .env")
+
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# Render-specific settings
+os.environ["PYTHONIOENCODING"] = "utf-8"
+USE_WEBHOOK = os.getenv("USE_WEBHOOK", "False").lower() == "true"
+WEBHOOK_URL = os.getenv("RENDER_WEBHOOK_URL")
+
 llm = ChatOpenAI(model="gpt-5.4", temperature=0.3)
 
-# Load components (same as before)
+# ======================== LOAD COMPONENTS ========================
+# RAG (Chroma)
 vectorstore = None
 try:
     embeddings = HuggingFaceEmbeddings(model_name="all-mpnet-base-v2")
@@ -31,98 +41,136 @@ try:
     from chromadb.config import Settings
     client = chromadb.PersistentClient(path="./chroma_db_v2", settings=Settings(allow_reset=True))
     vectorstore = Chroma(client=client, collection_name="nvidia_annual_reports_2014_2025", embedding_function=embeddings)
+    print("✅ RAG Loaded Successfully")
 except Exception as e:
-    print(f"⚠️ RAG failed: {e}")
+    print(f"⚠️ RAG load failed (will work without): {e}")
 
 ddg_search = DuckDuckGoSearchRun()
-checkpoint = joblib.load("nvidia_price_model.pkl")
-prophet_model = checkpoint['prophet_model']
-last_close = checkpoint['last_close']
+
+# Prophet Model
+try:
+    checkpoint = joblib.load("nvidia_price_model.pkl")
+    prophet_model = checkpoint['prophet_model']
+    last_close = checkpoint['last_close']
+    print("✅ Prophet Model Loaded")
+except:
+    prophet_model = None
+    last_close = 0
+    print("⚠️ Prophet model not found")
 
 df = pd.read_csv("nvda_2014_to_2026.csv", skiprows=[1])
 df['Date'] = pd.to_datetime(df['Date'])
 df = df.sort_values('Date').reset_index(drop=True)
 
-# ======================== CHART GENERATION ========================
-def generate_forecast_chart():
+# ======================== HELPER FUNCTIONS ========================
+def researcher_answer(query: str) -> str:
+    context = ""
+    if vectorstore:
+        docs = vectorstore.similarity_search(query, k=4)
+        context = "\n\n".join([doc.page_content[:500] for doc in docs])
+
+    news = ddg_search.run(f"NVIDIA {query} latest news OR Blackwell OR Huawei")[:600]
+
+    response = llm.invoke([
+        SystemMessage(content="You are a senior NVIDIA strategy analyst. Give concise, intelligent answers."),
+        HumanMessage(content=f"Question: {query}\n\nFrom Reports:\n{context}\n\nNews:\n{news}")
+    ]).content
+
+    return response[:3800] + "\n\n... (truncated)" if len(response) > 3800 else response
+
+
+def trader_forecast() -> str:
+    if not prophet_model:
+        return "Forecast service unavailable."
     try:
-        future = prophet_model.make_future_dataframe(periods=30, freq='B')
+        future = prophet_model.make_future_dataframe(periods=7, freq='B')
         future['MA7'] = df['Close'].rolling(7).mean().iloc[-1]
         future['MA30'] = df['Close'].rolling(30).mean().iloc[-1]
         future['Vol7'] = df['Close'].tail(7).std()
         future['Volume_MA7'] = df['Volume'].tail(7).mean()
 
         forecast = prophet_model.predict(future)
-        
-        fig = prophet_model.plot(forecast)
-        plt.title("NVIDIA 30-Day Price Forecast (Prophet Model)")
-        plt.xlabel("Date")
-        plt.ylabel("NVDA Share Price (USD)")
-        plt.grid(True)
-        
-        chart_path = "nvidia_daily_forecast.png"
-        plt.savefig(chart_path, dpi=200, bbox_inches='tight')
-        plt.close(fig)
-        return chart_path
+        pred = forecast.tail(7)[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
+        pred['ds'] = pred['ds'].dt.strftime('%Y-%m-%d')
+
+        final_pred = pred['yhat'].iloc[-1]
+        upside = (final_pred / last_close - 1) * 100
+
+        trade_rec = "🟢 STRONG BUY" if upside > 4 else "🟡 BUY" if upside > 1.8 else "🔴 SELL/CAUTION" if upside < -2.5 else "⚪ HOLD"
+
+        lines = [f"{row['ds']}: **${row['yhat']:.2f}**" for _, row in pred.iterrows()]
+
+        return f"""**🚀 NVIDIA 7-DAY FORECAST**
+Current: **${last_close:.2f}** → Day 7: **${final_pred:.2f}** ({upside:+.1f}%)
+**Recommendation:** {trade_rec}
+
+Predictions:
+""" + "\n".join(lines)
     except Exception as e:
-        print(f"Chart generation error: {e}")
-        return None
-
-
-# ======================== DYNAMIC FORECAST (keep your existing one) ========================
-# ... Paste your dynamic_forecast function here (from previous version) ...
-
-# ======================== DAILY ALERT WITH CHART ========================
-def send_daily_alert():
-    forecast_text = dynamic_forecast("daily forecast")   # Reuse your smart function
-    news = ddg_search.run("NVIDIA latest news OR Blackwell OR Huawei")[:500]
-
-    alert_text = f"""🚨 **NVIDIA DAILY ALERT** {datetime.now().strftime('%Y-%m-%d')}
-
-{forecast_text}
-
-📰 **Latest News:**
-{news}
-"""
-
-    chart_path = generate_forecast_chart()
-    
-    try:
-        if chart_path and os.path.exists(chart_path):
-            with open(chart_path, 'rb') as photo:
-                bot.send_photo(CHAT_ID, photo, caption=alert_text[:1000])  # Caption has limit
-            print("✅ Daily alert with chart sent")
-        else:
-            bot.send_message(CHAT_ID, alert_text)
-            print("✅ Daily alert (text only) sent")
-    except Exception as e:
-        print(f"Daily alert error: {e}")
-        bot.send_message(CHAT_ID, alert_text[:4000])
-
-
-# ======================== BREAKING NEWS (keep as before) ========================
-def check_breaking_news():
-    # ... (your existing breaking news function) ...
-    pass   # Keep the one from previous version
+        return f"Forecast error: {str(e)}"
 
 
 # ======================== BOT HANDLERS ========================
-# ... (keep your existing /start, /forecast, /news, handle_message) ...
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    bot.reply_to(message, "✅ **NVIDIA Bot is online!**\n\nCommands:\n/forecast - 7-day price prediction\n/news - Latest news")
+
+@bot.message_handler(commands=['forecast'])
+def send_forecast(message):
+    bot.reply_to(message, trader_forecast())
+
+@bot.message_handler(commands=['news'])
+def send_news(message):
+    bot.reply_to(message, ddg_search.run("NVIDIA latest news")[:1000])
+
+@bot.message_handler(func=lambda m: True)
+def handle_message(message):
+    bot.send_chat_action(message.chat.id, 'typing')
+    query = message.text.strip()
+
+    if any(k in query.lower() for k in ["forecast", "price", "predict", "7 day"]):
+        reply = trader_forecast()
+    else:
+        reply = researcher_answer(query)
+
+    bot.reply_to(message, reply)
+
+
+# ======================== DAILY ALERT ========================
+def send_daily_alert():
+    forecast = trader_forecast()
+    news = ddg_search.run("NVIDIA latest news OR Blackwell OR earnings")[:600]
+
+    alert = f"🚨 **NVIDIA DAILY ALERT** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n{forecast}\n\n📰 News:\n{news}"
+    try:
+        bot.send_message(CHAT_ID, alert)
+        print(f"✅ Daily alert sent at {datetime.now()}")
+    except Exception as e:
+        print(f"Alert error: {e}")
 
 
 # ======================== START ========================
 if __name__ == "__main__":
-    print("🚀 Nvidia_bot with Daily Chart Alert + Breaking News running...")
+    print("🚀 Nvidia_bot starting on Render...")
 
-    schedule.every(30).minutes.do(check_breaking_news)
-    schedule.every().day.at("08:00").do(send_daily_alert)   # Daily at 8 AM
+    send_daily_alert()                     # Send one immediately
+    schedule.every(60).minutes.do(send_daily_alert)
 
-    send_daily_alert()  # Send one immediately on start
-
-    while True:
-        try:
+    if USE_WEBHOOK and WEBHOOK_URL:
+        bot.remove_webhook()
+        time.sleep(1)
+        bot.set_webhook(url=WEBHOOK_URL)
+        print(f"✅ Webhook set to: {WEBHOOK_URL}")
+        # Keep process alive
+        while True:
             schedule.run_pending()
-            bot.polling(none_stop=True, interval=1, timeout=30)
-        except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(10)
+            time.sleep(60)
+    else:
+        print("🔄 Using polling mode...")
+        while True:
+            try:
+                schedule.run_pending()
+                bot.polling(none_stop=True, interval=1, timeout=30)
+            except Exception as e:
+                print(f"Polling error: {e}")
+                time.sleep(10)
