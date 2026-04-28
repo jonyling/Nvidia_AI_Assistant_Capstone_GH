@@ -7,6 +7,11 @@ import joblib
 import pandas as pd
 from datetime import datetime
 
+# ======================== MEMORY OPTIMIZATIONS ========================
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["CHROMA_NO_SERVER"] = "true"
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
 # LangChain
 from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
@@ -21,29 +26,38 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not BOT_TOKEN or not CHAT_ID:
-    raise ValueError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in .env")
+    raise ValueError("❌ TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in .env")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Render-specific settings
-os.environ["PYTHONIOENCODING"] = "utf-8"
+# Render settings
 USE_WEBHOOK = os.getenv("USE_WEBHOOK", "False").lower() == "true"
 WEBHOOK_URL = os.getenv("RENDER_WEBHOOK_URL")
 
 llm = ChatOpenAI(model="gpt-5.4", temperature=0.3)
 
 # ======================== LOAD COMPONENTS ========================
-# RAG (Chroma)
+# RAG with lightweight model
 vectorstore = None
 try:
-    embeddings = HuggingFaceEmbeddings(model_name="all-mpnet-base-v2")
+    embeddings = HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2",      # Light & fast
+        model_kwargs={"device": "cpu"}
+    )
     import chromadb
     from chromadb.config import Settings
-    client = chromadb.PersistentClient(path="./chroma_db_v2", settings=Settings(allow_reset=True))
-    vectorstore = Chroma(client=client, collection_name="nvidia_annual_reports_2014_2025", embedding_function=embeddings)
-    print("✅ RAG Loaded Successfully")
+    client = chromadb.PersistentClient(
+        path="./chroma_db_v2", 
+        settings=Settings(allow_reset=True)
+    )
+    vectorstore = Chroma(
+        client=client,
+        collection_name="nvidia_annual_reports_2014_2025",
+        embedding_function=embeddings
+    )
+    print("✅ RAG (MiniLM) Loaded Successfully")
 except Exception as e:
-    print(f"⚠️ RAG load failed (will work without): {e}")
+    print(f"⚠️ RAG load failed: {e}")
 
 ddg_search = DuckDuckGoSearchRun()
 
@@ -53,10 +67,10 @@ try:
     prophet_model = checkpoint['prophet_model']
     last_close = checkpoint['last_close']
     print("✅ Prophet Model Loaded")
-except:
+except Exception as e:
     prophet_model = None
     last_close = 0
-    print("⚠️ Prophet model not found")
+    print(f"⚠️ Prophet model failed to load: {e}")
 
 df = pd.read_csv("nvda_2014_to_2026.csv", skiprows=[1])
 df['Date'] = pd.to_datetime(df['Date'])
@@ -69,19 +83,20 @@ def researcher_answer(query: str) -> str:
         docs = vectorstore.similarity_search(query, k=4)
         context = "\n\n".join([doc.page_content[:500] for doc in docs])
 
-    news = ddg_search.run(f"NVIDIA {query} latest news OR Blackwell OR Huawei")[:600]
+    news = ddg_search.run(f"NVIDIA {query} latest news OR Blackwell OR Huawei OR earnings")[:600]
 
     response = llm.invoke([
-        SystemMessage(content="You are a senior NVIDIA strategy analyst. Give concise, intelligent answers."),
+        SystemMessage(content="You are a senior NVIDIA strategy analyst. Give concise but intelligent answers."),
         HumanMessage(content=f"Question: {query}\n\nFrom Reports:\n{context}\n\nNews:\n{news}")
     ]).content
 
+    # Keep under Telegram limit
     return response[:3800] + "\n\n... (truncated)" if len(response) > 3800 else response
 
 
 def trader_forecast() -> str:
     if not prophet_model:
-        return "Forecast service unavailable."
+        return "❌ Forecast service unavailable."
     try:
         future = prophet_model.make_future_dataframe(periods=7, freq='B')
         future['MA7'] = df['Close'].rolling(7).mean().iloc[-1]
@@ -113,7 +128,7 @@ Predictions:
 # ======================== BOT HANDLERS ========================
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "✅ **NVIDIA Bot is online!**\n\nCommands:\n/forecast - 7-day price prediction\n/news - Latest news")
+    bot.reply_to(message, "✅ **NVIDIA Bot is online!**\n\nCommands:\n/forecast - 7-day prediction\n/news - Latest news")
 
 @bot.message_handler(commands=['forecast'])
 def send_forecast(message):
@@ -128,7 +143,7 @@ def handle_message(message):
     bot.send_chat_action(message.chat.id, 'typing')
     query = message.text.strip()
 
-    if any(k in query.lower() for k in ["forecast", "price", "predict", "7 day"]):
+    if any(k in query.lower() for k in ["forecast", "price", "predict", "7 day", "next week"]):
         reply = trader_forecast()
     else:
         reply = researcher_answer(query)
@@ -151,7 +166,7 @@ def send_daily_alert():
 
 # ======================== START ========================
 if __name__ == "__main__":
-    print("🚀 Nvidia_bot starting on Render...")
+    print("🚀 Nvidia_bot starting on Render (MiniLM optimized)...")
 
     send_daily_alert()                     # Send one immediately
     schedule.every(60).minutes.do(send_daily_alert)
@@ -161,7 +176,7 @@ if __name__ == "__main__":
         time.sleep(1)
         bot.set_webhook(url=WEBHOOK_URL)
         print(f"✅ Webhook set to: {WEBHOOK_URL}")
-        # Keep process alive
+        # Keep alive
         while True:
             schedule.run_pending()
             time.sleep(60)
