@@ -1,0 +1,8 @@
+# NVIDIA AI Assistant - Capstone
+chroma_db_v2/
+__pycache__/
+*.log
+.env
+.DS_Store
+.vscode/
+.idea/
