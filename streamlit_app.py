@@ -35,29 +35,28 @@ llm = ChatOpenAI(model="gpt-5.4", temperature=0.3, max_tokens=1024)
 @st.cache_resource
 def load_rag():
     try:
-        device = "cpu"
-        embeddings = HuggingFaceEmbeddings(model_name="all-mpnet-base-v2", model_kwargs={"device": device})
-        
+        embeddings = HuggingFaceEmbeddings(
+            model_name="all-mpnet-base-v2",
+            model_kwargs={"device": "cpu"}
+        )
         import chromadb
         from chromadb.config import Settings
-        client = chromadb.PersistentClient(path=DRIVE_DB_PATH, settings=Settings(allow_reset=True))
         
-        # Check if collection exists and has data
-        collections = client.list_collections()
-        if not any(c.name == "nvidia_annual_reports_2014_2025" for c in collections):
-            raise Exception("Collection not found")
-            
-        vectorstore = Chroma(client=client, collection_name="nvidia_annual_reports_2014_2025", embedding_function=embeddings)
-        print("✅ RAG Loaded from existing DB")
+        client = chromadb.PersistentClient(
+            path="./chroma_db_v2", 
+            settings=Settings(allow_reset=True)
+        )
+        
+        vectorstore = Chroma(
+            client=client,
+            collection_name="nvidia_annual_reports_2014_2025",
+            embedding_function=embeddings
+        )
+        st.sidebar.success("✅ RAG (ChromaDB) Loaded from LFS")
         return vectorstore
-    except:
-        print("⚠️ ChromaDB not found or empty. Building fresh...")
-        # Add code here to rebuild from PDFs (I can give you this part if needed)
-        st.warning("Building RAG database... This may take 2-5 minutes on first run.")
-        # ... rebuild logic ...
+    except Exception as e:
+        st.sidebar.error(f"RAG Load Failed: {e}")
         return None
-
-vectorstore = load_rag()
 
 df = pd.read_csv(CSV_PATH, skiprows=[1])
 df['Date'] = pd.to_datetime(df['Date'])
