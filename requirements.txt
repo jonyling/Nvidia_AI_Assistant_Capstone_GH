@@ -1,5 +1,6 @@
 chromadb
 duckduckgo-search
+ddgs
 gradio
 joblib
 langchain
