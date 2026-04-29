@@ -16,6 +16,7 @@ plotly
 prophet
 pypdf
 python-dotenv
+schedule
 sentence-transformers
 streamlit
 tabulate

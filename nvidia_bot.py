@@ -32,6 +32,31 @@ DRIVE_DB_PATH = "./chroma_db_v2"
 CSV_PATH = "nvda_2014_to_2026.csv"
 MODEL_PATH = "nvidia_price_model.pkl"
 
+from flask import Flask
+import threading
+import os
+
+# Flask for Render health check
+health_app = Flask(__name__)
+
+@health_app.route('/')
+def health():
+    return "NVIDIA Bot is running! ✅", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    health_app.run(host="0.0.0.0", port=port, debug=False)
+
+# Then in if __name__ == "__main__":
+if __name__ == "__main__":
+    print("🚀 Nvidia_bot starting on Render...")
+    
+    # Start health check server
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # ... rest of your scheduler + bot.polling() ...
+
 # ======================== LOAD COMPONENTS ========================
 vectorstore = None
 try:
