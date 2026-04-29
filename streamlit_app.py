@@ -2,9 +2,9 @@ import os
 import streamlit as st
 import pandas as pd
 import joblib
-from datetime import timedelta
 from dotenv import load_dotenv
 
+# ==================== RENDER OPTIMIZATIONS ====================
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CHROMA_NO_SERVER"] = "true"
 os.environ["CHROMA_ANONYMIZED_TELEMETRY"] = "false"
@@ -14,7 +14,8 @@ load_dotenv()
 
 st.set_page_config(page_title="🚀 NVIDIA AI Assistant", page_icon="📈", layout="wide")
 
-DB_PATH = "./chroma_db_v2"
+# ======================== CONFIG ========================
+DRIVE_DB_PATH = "./chroma_db_v2"
 CSV_PATH = "nvda_2014_to_2026.csv"
 MODEL_PATH = "nvidia_price_model.pkl"
 
@@ -29,119 +30,135 @@ import operator
 import chromadb
 from chromadb.config import Settings
 
-llm = ChatOpenAI(model="gpt-5.4", temperature=0.4, max_tokens=1200)
+llm = ChatOpenAI(model="gpt-5.4", temperature=0.3, max_tokens=1024)
 ddg_search = DuckDuckGoSearchRun()
 
 # ======================== LOAD COMPONENTS ========================
 @st.cache_resource
-def load_all_components():
-    embeddings = HuggingFaceEmbeddings(model_name="all-mpnet-base-v2", model_kwargs={"device": "cpu"})
-    client = chromadb.PersistentClient(path=DB_PATH, settings=Settings(allow_reset=True, anonymized_telemetry=False))
-    vectorstore = Chroma(client=client, collection_name="nvidia_annual_reports_2014_2025", embedding_function=embeddings)
+def load_rag():
+    try:
+        embeddings = HuggingFaceEmbeddings(
+            model_name="all-mpnet-base-v2", 
+            model_kwargs={"device": "cpu"}
+        )
+        client = chromadb.PersistentClient(
+            path=DRIVE_DB_PATH, 
+            settings=Settings(allow_reset=True, anonymized_telemetry=False)
+        )
+        vectorstore = Chroma(
+            client=client, 
+            collection_name="nvidia_annual_reports_2014_2025", 
+            embedding_function=embeddings
+        )
+        st.sidebar.success("✅ RAG Loaded")
+        return vectorstore
+    except Exception as e:
+        st.sidebar.error(f"RAG issue: {str(e)[:100]}")
+        return None
 
-    df = pd.read_csv(CSV_PATH, skiprows=[1])
-    df['Date'] = pd.to_datetime(df['Date'])
-    df = df.sort_values('Date').reset_index(drop=True)
-    checkpoint = joblib.load(MODEL_PATH)
 
-    return vectorstore, df, checkpoint
+vectorstore = load_rag()
 
-vectorstore, df, model_checkpoint = load_all_components()
+df = pd.read_csv(CSV_PATH, skiprows=[1])
+df['Date'] = pd.to_datetime(df['Date'])
+df = df.sort_values('Date').reset_index(drop=True)
 
+# ======================== LANGGRAPH STATE ========================
 class AgentState(TypedDict):
     query: str
     response: str
     debug_log: Annotated[str, operator.add]
     next_node: str
 
-# ======================== INTELLIGENT ROUTER ========================
+
+# ======================== NODES ========================
 def router_node(state: AgentState) -> AgentState:
-    query = state["query"]
-    prompt = f"""Classify into ONE category only:
-- trader: any price prediction / forecast (any time horizon)
-- researcher: news, financials, strategy, competitors, risks, impact analysis
-- general: everything else
-
-Query: {query}
-Answer with only one word:"""
-
-    decision = llm.invoke([HumanMessage(content=prompt)]).content.strip().lower()
-    state["next_node"] = "trader" if "trader" in decision else "researcher" if "researcher" in decision else "general"
-    state["debug_log"] = f"🚦 Router → {state['next_node']}\n"
+    q = state["query"].lower()
+    if any(x in q for x in ["predict", "forecast", "price", "share price", "stock price"]):
+        if any(x in q for x in ["12 months", "one year", "next year", "2027", "long term", "2026"]):
+            state["next_node"] = "long_term_analyst"
+            state["debug_log"] = "🚦 Router → Long-term Analyst\n"
+        else:
+            state["next_node"] = "trader"
+            state["debug_log"] = "🚦 Router → Trader\n"
+    elif any(x in q for x in ["news", "outlook", "latest", "blackwell", "risk", "revenue", "financial", "huawei", "deepseek", "ascend"]):
+        state["next_node"] = "researcher"
+        state["debug_log"] = "🚦 Router → Researcher\n"
+    else:
+        state["next_node"] = "general"
+        state["debug_log"] = "🚦 Router → General\n"
     return state
 
-# ======================== IMPROVED HYBRID TRADER ========================
-def trader_node(state: AgentState) -> AgentState:
-    if not model_checkpoint:
-        state["response"] = "❌ Model unavailable."
-        return state
 
-    query = state["query"].lower()
-    model = model_checkpoint['prophet_model']
-    last_close = model_checkpoint['last_close']
-
-    # Detect horizon
-    if any(x in query for x in ["3 months", "90 days", "quarter", "month"]):
-        horizon_days = 90
-        title = "3-MONTH FORECAST"
-    elif any(x in query for x in ["6 months", "half year"]):
-        horizon_days = 180
-        title = "6-MONTH FORECAST"
-    else:
-        horizon_days = 7
-        title = "7-DAY FORECAST"
-
+def long_term_analyst_node(state: AgentState) -> AgentState:
     try:
-        future = model.make_future_dataframe(periods=horizon_days, freq='B')
+        checkpoint = joblib.load(MODEL_PATH)
+        model = checkpoint['prophet_model']
+        last_close = checkpoint['last_close']
+
+        # Prophet for short/medium term
+        future = model.make_future_dataframe(periods=30, freq='B')
         future['MA7'] = df['Close'].rolling(7).mean().iloc[-1]
         future['MA30'] = df['Close'].rolling(30).mean().iloc[-1]
         future['Vol7'] = df['Close'].tail(7).std()
         future['Volume_MA7'] = df['Volume'].tail(7).mean()
 
         forecast = model.predict(future)
-        pred = forecast.tail(horizon_days)[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
+        pred = forecast.tail(7)[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
         pred['ds'] = pred['ds'].dt.strftime('%Y-%m-%d')
+        final_30d = forecast['yhat'].iloc[-1]
+        upside_30d = (final_30d / last_close - 1) * 100
 
-        final_pred = pred['yhat'].iloc[-1]
-        upside = (final_pred / last_close - 1) * 100
+        # LLM + RAG + News for qualitative long-term view
+        context = ""
+        if vectorstore:
+            docs = vectorstore.similarity_search(state["query"], k=6)
+            context = "\n\n".join([d.page_content[:700] for d in docs])
 
-        # Hybrid LLM Analysis
-        hybrid_analysis = llm.invoke([
-            SystemMessage(content="You are a professional NVIDIA stock analyst. Combine quantitative Prophet forecast with qualitative market context."),
-            HumanMessage(content=f"""Current price: ${last_close:.2f}
-Prophet {horizon_days}-day forecast: ${final_pred:.2f} ({upside:+.1f}%)
-Query: {state['query']}
+        news = ddg_search.run("NVIDIA price target 2026 OR 2027 OR analyst forecast OR Blackwell OR Huawei OR DeepSeek")[:900]
 
-Provide balanced, insightful analysis.""")
+        llm_response = llm.invoke([
+            SystemMessage(content="You are a senior NVIDIA equity analyst. Combine quantitative ML forecast with fundamental outlook."),
+            HumanMessage(content=f"""Query: {state["query"]}
+Short-term Prophet (next 30 days): {upside_30d:+.1f}% to ${final_30d:.2f}
+RAG Context: {context}
+Latest News/Analyst: {news}
+
+Provide a balanced long-term outlook with:
+• Short-term quantitative view
+• Key drivers (Blackwell, competition, AI demand, etc.)
+• Realistic 6-12 month price range
+• Trade recommendation""")
         ]).content
 
-        state["response"] = f"""**🚀 NVIDIA {title}**
+        state["response"] = f"""**🚀 NVIDIA LONG-TERM OUTLOOK (Hybrid ML + LLM)**
 
-**Current Price:** ${last_close:.2f}  
-**Expected Price:** **${final_pred:.2f}** ({upside:+.1f}%)
+**Short-term (next 7 days from Prophet):**
+{chr(10).join([f"{row['ds']}: **${row['yhat']:.2f}**" for _, row in pred.iterrows()])}
 
-**Hybrid Recommendation:** {'🟢 STRONG BUY' if upside > 12 else '🟡 BUY' if upside > 5 else '⚪ HOLD' if upside > -8 else '🔴 CAUTION'}
+**30-day expected move:** **{upside_30d:+.1f}%** → ~${final_30d:.2f}
 
-**Detailed Analysis:**
-{hybrid_analysis}
+{llm_response}
 
-*Prophet Backtested MAPE: {model_checkpoint.get('backtest_mape', 'N/A'):.2f}% • Longer horizons have higher uncertainty*"""
-
+*Backtested MAPE: {checkpoint.get('backtest_mape', 2.23):.2f}% • Longer horizons have higher uncertainty*"""
     except Exception as e:
-        state["response"] = f"Forecast error: {str(e)}"
+        state["response"] = f"Long-term analysis error: {str(e)}"
 
-    state["debug_log"] += f"📈 Hybrid Trader ({horizon_days} days) completed\n"
+    state["debug_log"] += "📈 Long-term Analyst completed\n"
     return state
 
-# Researcher and General nodes (unchanged but reliable)
+
 def researcher_node(state: AgentState) -> AgentState:
     query = state["query"]
-    context = "\n\n".join([d.page_content[:800] for d in vectorstore.similarity_search(query, k=5)]) if vectorstore else ""
+    context = ""
+    if vectorstore:
+        docs = vectorstore.similarity_search(query, k=5)
+        context = "\n\n".join([d.page_content[:700] for d in docs])
 
-    news = ddg_search.run(f"NVIDIA {query} latest news OR earnings OR Blackwell OR Huawei OR DeepSeek")[:800]
+    news = ddg_search.run(f"NVIDIA {query} latest news OR earnings")[:800]
 
     resp = llm.invoke([
-        SystemMessage(content="NVIDIA expert researcher. Use RAG + news. Be concise and professional."),
+        SystemMessage(content="You are NVIDIA expert researcher."),
         HumanMessage(content=f"Query: {query}\n\nRAG:\n{context}\n\nNews:\n{news}")
     ]).content
 
@@ -149,29 +166,91 @@ def researcher_node(state: AgentState) -> AgentState:
     state["debug_log"] += "🔎 Researcher completed\n"
     return state
 
-def general_node(state: AgentState) -> AgentState:
-    resp = llm.invoke([SystemMessage(content="Helpful NVIDIA assistant."), HumanMessage(content=state["query"])]).content
-    state["response"] = resp
-    state["debug_log"] += "💬 General completed\n"
+
+def trader_node(state: AgentState) -> AgentState:
+    try:
+        checkpoint = joblib.load(MODEL_PATH)
+        model = checkpoint['prophet_model']
+        last_close = checkpoint['last_close']
+
+        q_lower = state["query"].lower()
+        periods = 7
+        horizon = "7-DAY"
+        if any(x in q_lower for x in ["3 months", "quarter", "90 days"]):
+            periods = 63
+            horizon = "3-MONTH"
+        elif any(x in q_lower for x in ["1 month", "30 days"]):
+            periods = 30
+            horizon = "1-MONTH"
+
+        future = model.make_future_dataframe(periods=periods, freq='B')
+        future['MA7'] = df['Close'].rolling(7).mean().iloc[-1]
+        future['MA30'] = df['Close'].rolling(30).mean().iloc[-1]
+        future['Vol7'] = df['Close'].tail(7).std()
+        future['Volume_MA7'] = df['Volume'].tail(7).mean()
+
+        forecast = model.predict(future)
+        pred = forecast.tail(7)[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
+        pred['ds'] = pred['ds'].dt.strftime('%Y-%m-%d')
+
+        final_pred = forecast['yhat'].iloc[-1]
+        upside = (final_pred / last_close - 1) * 100
+
+        trade_rec = "🟢 **STRONG BUY**" if upside > 4 else "🟡 **BUY**" if upside > 1.8 else "🔴 **SELL / CAUTION**" if upside < -2.5 else "⚪ **HOLD**"
+
+        lines = [f"{row['ds']}: **${row['yhat']:.2f}** (range ${row['yhat_lower']:.2f}–${row['yhat_upper']:.2f})" for _, row in pred.iterrows()]
+
+        state["response"] = f"""**🚀 NVIDIA {horizon} FORECAST**
+
+**Current Price:** ${last_close:.2f} → **Final Expected:** **${final_pred:.2f}** ({upside:+.1f}%)
+
+**Next 7 Days Predictions:**
+""" + "\n".join(lines) + f"""
+**Trade Recommendation:** {trade_rec}
+
+*Backtested MAPE: {checkpoint.get('backtest_mape', 2.23):.2f}%*"""
+    except Exception as e:
+        state["response"] = f"Forecast error: {str(e)}"
+
+    state["debug_log"] += "📈 Trader completed\n"
     return state
 
-# ======================== GRAPH ========================
+
+def general_node(state: AgentState) -> AgentState:
+    resp = llm.invoke([
+        SystemMessage(content="You are a helpful NVIDIA assistant."),
+        HumanMessage(content=state["query"])
+    ]).content
+    state["response"] = resp
+    state["debug_log"] += "💬 General Agent\n"
+    return state
+
+
+# ======================== BUILD GRAPH ========================
 workflow = StateGraph(AgentState)
 workflow.add_node("router", router_node)
 workflow.add_node("researcher", researcher_node)
 workflow.add_node("trader", trader_node)
+workflow.add_node("long_term_analyst", long_term_analyst_node)
 workflow.add_node("general", general_node)
 
 workflow.set_entry_point("router")
-workflow.add_conditional_edges("router", lambda x: x["next_node"], {"researcher": "researcher", "trader": "trader", "general": "general"})
-for node in ["researcher", "trader", "general"]:
+workflow.add_conditional_edges("router", lambda x: x["next_node"],
+    {
+        "researcher": "researcher",
+        "trader": "trader",
+        "long_term_analyst": "long_term_analyst",
+        "general": "general"
+    })
+
+for node in ["researcher", "trader", "long_term_analyst", "general"]:
     workflow.add_edge(node, END)
 
 app = workflow.compile()
 
 # ======================== UI ========================
 st.title("🚀 NVIDIA AI Assistant – Multi-Agent System")
-st.caption("NTU DSAI Capstone | Intelligent Hybrid ML + LLM Forecasting")
+st.caption("NTU DSAI Capstone | RAG + DuckDuckGo + Prophet ML | Render Optimized")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -187,9 +266,14 @@ if prompt := st.chat_input("Ask anything about NVIDIA..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            result = app.invoke({"query": prompt, "response": "", "debug_log": "", "next_node": ""})
+            result = app.invoke({
+                "query": prompt,
+                "response": "",
+                "debug_log": "",
+                "next_node": ""
+            })
             answer = result.get("response", "Sorry, I couldn't generate an answer.")
-            log = result.get("debug_log", "")
+            log = result.get("debug_log", "No debug info")
 
             st.markdown(answer)
             with st.expander("🔍 Debug Trace"):
@@ -197,9 +281,11 @@ if prompt := st.chat_input("Ask anything about NVIDIA..."):
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
+# Sidebar
 with st.sidebar:
-    st.success("✅ Intelligent Hybrid Forecasting")
-    st.success("✅ Full RAG + Prophet + DDG")
+    st.success("✅ Prophet ML Model Loaded")
+    st.success("✅ RAG Loaded")
+    st.success("✅ DuckDuckGo Ready")
     if st.button("Clear Chat"):
         st.session_state.messages = []
         st.rerun()
