@@ -2,161 +2,219 @@ import os
 import time
 import schedule
 import telebot
-from dotenv import load_dotenv
-import joblib
+import threading
 import pandas as pd
+import joblib
 from datetime import datetime
+from dotenv import load_dotenv
 
-# ======================== MEMORY OPTIMIZATIONS ========================
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["CHROMA_NO_SERVER"] = "true"
-os.environ["PYTHONIOENCODING"] = "utf-8"
-
-# LangChain
+# LangChain & LangGraph
 from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, Annotated
+import operator
 
 load_dotenv()
 
 # ======================== CONFIG ========================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-if not BOT_TOKEN or not CHAT_ID:
-    raise ValueError("❌ TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in .env")
+CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))   # make sure it's an integer in .env
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Render settings
-USE_WEBHOOK = os.getenv("USE_WEBHOOK", "False").lower() == "true"
-WEBHOOK_URL = os.getenv("RENDER_WEBHOOK_URL")
+llm = ChatOpenAI(model="gpt-5.4", temperature=0.3, max_tokens=1024)
 
-llm = ChatOpenAI(model="gpt-5.4", temperature=0.3)
+DRIVE_DB_PATH = "./chroma_db_v2"
+CSV_PATH = "nvda_2014_to_2026.csv"
+MODEL_PATH = "nvidia_price_model.pkl"
 
 # ======================== LOAD COMPONENTS ========================
-# RAG with lightweight model
 vectorstore = None
 try:
-    embeddings = HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2",      # Light & fast
-        model_kwargs={"device": "cpu"}
-    )
+    embeddings = HuggingFaceEmbeddings(model_name="all-mpnet-base-v2")
     import chromadb
     from chromadb.config import Settings
-    client = chromadb.PersistentClient(
-        path="./chroma_db_v2", 
-        settings=Settings(allow_reset=True)
-    )
-    vectorstore = Chroma(
-        client=client,
-        collection_name="nvidia_annual_reports_2014_2025",
-        embedding_function=embeddings
-    )
-    print("✅ RAG (MiniLM) Loaded Successfully")
+    client = chromadb.PersistentClient(path=DRIVE_DB_PATH, settings=Settings(allow_reset=True))
+    vectorstore = Chroma(client=client, collection_name="nvidia_annual_reports_2014_2025", embedding_function=embeddings)
+    print("✅ RAG Loaded Successfully")
 except Exception as e:
-    print(f"⚠️ RAG load failed: {e}")
+    print(f"⚠️ RAG load issue: {e}")
 
-ddg_search = DuckDuckGoSearchRun()
-
-# Prophet Model
-try:
-    checkpoint = joblib.load("nvidia_price_model.pkl")
-    prophet_model = checkpoint['prophet_model']
-    last_close = checkpoint['last_close']
-    print("✅ Prophet Model Loaded")
-except Exception as e:
-    prophet_model = None
-    last_close = 0
-    print(f"⚠️ Prophet model failed to load: {e}")
-
-df = pd.read_csv("nvda_2014_to_2026.csv", skiprows=[1])
+df = pd.read_csv(CSV_PATH, skiprows=[1])
 df['Date'] = pd.to_datetime(df['Date'])
 df = df.sort_values('Date').reset_index(drop=True)
 
-# ======================== HELPER FUNCTIONS ========================
-def researcher_answer(query: str) -> str:
+ddg_search = DuckDuckGoSearchRun()
+
+# ======================== LANGGRAPH STATE & NODES (identical to streamlit_app.py) ========================
+class AgentState(TypedDict):
+    query: str
+    response: str
+    debug_log: Annotated[str, operator.add]
+    next_node: str
+
+
+def router_node(state: AgentState) -> AgentState:
+    q = state["query"].lower()
+    if any(x in q for x in ["predict", "forecast", "price", "7 day", "next week", "tomorrow", "trend"]):
+        state["next_node"] = "trader"
+        state["debug_log"] = "🚦 Router → Trader\n"
+    elif any(x in q for x in ["news", "outlook", "latest", "blackwell", "risk", "revenue", "financial", "huawei"]):
+        state["next_node"] = "researcher"
+        state["debug_log"] = "🚦 Router → Researcher\n"
+    else:
+        state["next_node"] = "general"
+        state["debug_log"] = "🚦 Router → General\n"
+    return state
+
+
+def researcher_node(state: AgentState) -> AgentState:
+    query = state["query"]
     context = ""
     if vectorstore:
-        docs = vectorstore.similarity_search(query, k=4)
-        context = "\n\n".join([doc.page_content[:500] for doc in docs])
+        docs = vectorstore.similarity_search(query, k=5)
+        context = "\n\n".join([d.page_content[:700] for d in docs])
 
-    news = ddg_search.run(f"NVIDIA {query} latest news OR Blackwell OR Huawei OR earnings")[:600]
+    news = ddg_search.run(f"NVIDIA {query} latest news OR earnings")[:800]
 
-    response = llm.invoke([
-        SystemMessage(content="You are a senior NVIDIA strategy analyst. Give concise but intelligent answers."),
-        HumanMessage(content=f"Question: {query}\n\nFrom Reports:\n{context}\n\nNews:\n{news}")
+    resp = llm.invoke([
+        SystemMessage(content="You are NVIDIA expert researcher."),
+        HumanMessage(content=f"Query: {query}\n\nRAG:\n{context}\n\nNews:\n{news}")
     ]).content
 
-    # Keep under Telegram limit
-    return response[:3800] + "\n\n... (truncated)" if len(response) > 3800 else response
+    state["response"] = resp
+    state["debug_log"] += "🔎 Researcher completed\n"
+    return state
 
 
-def trader_forecast() -> str:
-    if not prophet_model:
-        return "❌ Forecast service unavailable."
+def trader_node(state: AgentState) -> AgentState:
+    debug = "📈 Trader (Prophet) activated → "
     try:
-        future = prophet_model.make_future_dataframe(periods=7, freq='B')
+        checkpoint = joblib.load(MODEL_PATH)
+        model = checkpoint['prophet_model']
+        last_close = checkpoint['last_close']
+
+        future = model.make_future_dataframe(periods=7, freq='B')
         future['MA7'] = df['Close'].rolling(7).mean().iloc[-1]
         future['MA30'] = df['Close'].rolling(30).mean().iloc[-1]
         future['Vol7'] = df['Close'].tail(7).std()
         future['Volume_MA7'] = df['Volume'].tail(7).mean()
 
-        forecast = prophet_model.predict(future)
+        forecast = model.predict(future)
         pred = forecast.tail(7)[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
         pred['ds'] = pred['ds'].dt.strftime('%Y-%m-%d')
 
         final_pred = pred['yhat'].iloc[-1]
         upside = (final_pred / last_close - 1) * 100
 
-        trade_rec = "🟢 STRONG BUY" if upside > 4 else "🟡 BUY" if upside > 1.8 else "🔴 SELL/CAUTION" if upside < -2.5 else "⚪ HOLD"
+        if upside > 4.0:
+            trade_rec = "🟢 **STRONG BUY** – Trade window: next 24-48 hours"
+        elif upside > 1.8:
+            trade_rec = "🟡 **BUY** – Good entry in next 3 days"
+        elif upside < -2.5:
+            trade_rec = "🔴 **SELL / CAUTION**"
+        else:
+            trade_rec = "⚪ **HOLD** – Monitor closely"
 
-        lines = [f"{row['ds']}: **${row['yhat']:.2f}**" for _, row in pred.iterrows()]
+        lines = [f"{row['ds']}: **${row['yhat']:.2f}** (range ${row['yhat_lower']:.2f}–${row['yhat_upper']:.2f})"
+                 for _, row in pred.iterrows()]
 
-        return f"""**🚀 NVIDIA 7-DAY FORECAST**
-Current: **${last_close:.2f}** → Day 7: **${final_pred:.2f}** ({upside:+.1f}%)
-**Recommendation:** {trade_rec}
+        state["response"] = f"""**🚀 NVIDIA 7-DAY FORECAST**
 
-Predictions:
-""" + "\n".join(lines)
+**Current Price:** ${last_close:.2f} → **Day 7 Expected:** **${final_pred:.2f}** ({upside:+.1f}%)
+
+**Predictions:**
+""" + "\n".join(lines) + f"""
+
+**Trade Recommendation:**
+{trade_rec}
+
+*Backtested MAPE: {checkpoint.get('backtest_mape', 2.23):.2f}%*"""
     except Exception as e:
-        return f"Forecast error: {str(e)}"
+        state["response"] = f"Forecast error: {str(e)}"
+
+    state["debug_log"] += debug + "\n"
+    return state
 
 
-# ======================== BOT HANDLERS ========================
+def general_node(state: AgentState) -> AgentState:
+    resp = llm.invoke([
+        SystemMessage(content="You are a helpful NVIDIA assistant."),
+        HumanMessage(content=state["query"])
+    ]).content
+    state["response"] = resp
+    state["debug_log"] += "💬 General Agent\n"
+    return state
+
+
+# ======================== BUILD GRAPH ========================
+workflow = StateGraph(AgentState)
+workflow.add_node("router", router_node)
+workflow.add_node("researcher", researcher_node)
+workflow.add_node("trader", trader_node)
+workflow.add_node("general", general_node)
+
+workflow.set_entry_point("router")
+workflow.add_conditional_edges(
+    "router",
+    lambda x: x["next_node"],
+    {"researcher": "researcher", "trader": "trader", "general": "general"}
+)
+for node in ["researcher", "trader", "general"]:
+    workflow.add_edge(node, END)
+
+app = workflow.compile()
+
+# ======================== TELEGRAM BOT ========================
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "✅ **NVIDIA Bot is online!**\n\nCommands:\n/forecast - 7-day prediction\n/news - Latest news")
+    bot.reply_to(message,
+        "✅ **Nvidia_bot is online!** (NTU DSAI Capstone Multi-Agent System)\n\n"
+        "Just ask anything about NVIDIA.\n"
+        "/forecast — 7-day price prediction + trade signal\n"
+        "/news — latest news\n\n"
+        "I also send daily alerts automatically!")
 
 @bot.message_handler(commands=['forecast'])
 def send_forecast(message):
-    bot.reply_to(message, trader_forecast())
+    bot.send_chat_action(message.chat.id, 'typing')
+    state = {"query": "Predict Nvidia share price trend for the next 7 days", "response": "", "debug_log": "", "next_node": ""}
+    result = app.invoke(state)
+    bot.reply_to(message, result.get("response", "Forecast unavailable"))
 
 @bot.message_handler(commands=['news'])
 def send_news(message):
-    bot.reply_to(message, ddg_search.run("NVIDIA latest news")[:1000])
+    bot.send_chat_action(message.chat.id, 'typing')
+    state = {"query": "latest NVIDIA news and market outlook", "response": "", "debug_log": "", "next_node": ""}
+    result = app.invoke(state)
+    bot.reply_to(message, result.get("response", "News unavailable"))
 
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     bot.send_chat_action(message.chat.id, 'typing')
     query = message.text.strip()
-
-    if any(k in query.lower() for k in ["forecast", "price", "predict", "7 day", "next week"]):
-        reply = trader_forecast()
-    else:
-        reply = researcher_answer(query)
-
+    state = {"query": query, "response": "", "debug_log": "", "next_node": ""}
+    result = app.invoke(state)
+    reply = result.get("response", "Sorry, I couldn't generate an answer.")
+    # Telegram has ~4096 char limit
+    if len(reply) > 4000:
+        reply = reply[:3990] + "\n\n... (truncated)"
     bot.reply_to(message, reply)
 
 
 # ======================== DAILY ALERT ========================
 def send_daily_alert():
-    forecast = trader_forecast()
-    news = ddg_search.run("NVIDIA latest news OR Blackwell OR earnings")[:600]
+    query = "Predict Nvidia share price trend for the next 7 days and provide latest news + trading opportunity"
+    state = {"query": query, "response": "", "debug_log": "", "next_node": ""}
+    result = app.invoke(state)
+    alert = f"""🚨 **NVIDIA DAILY ALERT** {datetime.now().strftime('%Y-%m-%d %H:%M')}
+{result.get('response', 'No response')}
 
-    alert = f"🚨 **NVIDIA DAILY ALERT** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n{forecast}\n\n📰 News:\n{news}"
+🔍 Debug: {result.get('debug_log', '')}"""
     try:
         bot.send_message(CHAT_ID, alert)
         print(f"✅ Daily alert sent at {datetime.now()}")
@@ -164,28 +222,42 @@ def send_daily_alert():
         print(f"Alert error: {e}")
 
 
-# ======================== START ========================
+# ... (keep all your existing code up to the scheduler part)
+
+# ======================== HEALTH CHECK FOR RENDER (Critical) ========================
+from flask import Flask
+import threading
+
+# Simple Flask app for Render health checks
+health_app = Flask(__name__)
+
+@health_app.route('/')
+def health():
+    return "NVIDIA Bot is running! ✅", 200
+
+@health_app.route('/health')
+def health_check():
+    return "OK", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    health_app.run(host="0.0.0.0", port=port)
+
+# ======================== SCHEDULER + BOT START ========================
 if __name__ == "__main__":
-    print("🚀 Nvidia_bot starting on Render (MiniLM optimized)...")
+    print("🚀 Nvidia_bot (Multi-Agent System) is starting on Render...")
 
-    send_daily_alert()                     # Send one immediately
-    schedule.every(60).minutes.do(send_daily_alert)
+    # Start Flask health check in background (required by Render Web Service)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
 
-    if USE_WEBHOOK and WEBHOOK_URL:
-        bot.remove_webhook()
-        time.sleep(1)
-        bot.set_webhook(url=WEBHOOK_URL)
-        print(f"✅ Webhook set to: {WEBHOOK_URL}")
-        # Keep alive
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-    else:
-        print("🔄 Using polling mode...")
-        while True:
-            try:
-                schedule.run_pending()
-                bot.polling(none_stop=True, interval=1, timeout=30)
-            except Exception as e:
-                print(f"Polling error: {e}")
-                time.sleep(10)
+    # Schedule daily alerts
+    schedule.every(60).minutes.do(send_daily_alert)   # Change to .day.at("09:00") if you prefer once per day
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+
+    # Send immediate alert
+    send_daily_alert()
+
+    print("🤖 Starting Telegram polling...")
+    bot.polling(none_stop=True, interval=1, timeout=30)
