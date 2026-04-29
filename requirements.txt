@@ -15,6 +15,7 @@ pandas
 plotly
 prophet
 pypdf
+pyTelegramBotAPI
 python-dotenv
 schedule
 sentence-transformers
