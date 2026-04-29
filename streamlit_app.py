@@ -4,7 +4,7 @@ import pandas as pd
 import joblib
 from dotenv import load_dotenv
 
-# ==================== MEMORY & TELEMETRY FIXES ====================
+# ==================== MEMORY & TELEMETRY OPTIMIZATIONS ====================
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CHROMA_NO_SERVER"] = "true"
 os.environ["CHROMA_ANONYMIZED_TELEMETRY"] = "false"
@@ -19,44 +19,49 @@ DB_PATH = "./chroma_db_v2"
 CSV_PATH = "nvda_2014_to_2026.csv"
 MODEL_PATH = "nvidia_price_model.pkl"
 
+# ======================== IMPORTS ========================
+from langchain_openai import ChatOpenAI
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, Annotated
+import operator
+import chromadb
+from chromadb.config import Settings
+
 llm = ChatOpenAI(model="gpt-5.4", temperature=0.3, max_tokens=1024)
 ddg_search = DuckDuckGoSearchRun()
 
-# ======================== LAZY LOADERS (Memory Safe) ========================
-@st.cache_resource(show_spinner=False)
-def get_vectorstore():
-    try:
-        from chromadb.config import Settings
-        embeddings = HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu"}
-        )
-        client = chromadb.PersistentClient(
-            path=DB_PATH,
-            settings=Settings(allow_reset=True, anonymized_telemetry=False)
-        )
-        vs = Chroma(
-            client=client,
-            collection_name="nvidia_annual_reports_2014_2025",
-            embedding_function=embeddings
-        )
-        return vs
-    except Exception as e:
-        st.sidebar.error(f"❌ RAG failed: {str(e)[:80]}")
-        return None
+# ======================== LOAD EVERYTHING AT STARTUP (2GB Safe) ========================
+@st.cache_resource
+def load_all_components():
+    # RAG
+    embeddings = HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"}
+    )
+    client = chromadb.PersistentClient(
+        path=DB_PATH,
+        settings=Settings(allow_reset=True, anonymized_telemetry=False)
+    )
+    vectorstore = Chroma(
+        client=client,
+        collection_name="nvidia_annual_reports_2014_2025",
+        embedding_function=embeddings
+    )
+
+    # Data + Model
+    df = pd.read_csv(CSV_PATH, skiprows=[1])
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df.sort_values('Date').reset_index(drop=True)
+    checkpoint = joblib.load(MODEL_PATH)
+
+    return vectorstore, df, checkpoint
 
 
-@st.cache_resource(show_spinner=False)
-def get_model_and_df():
-    try:
-        df = pd.read_csv(CSV_PATH, skiprows=[1])
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.sort_values('Date').reset_index(drop=True)
-        checkpoint = joblib.load(MODEL_PATH)
-        return df, checkpoint
-    except Exception:
-        return None, None
-
+vectorstore, df, model_checkpoint = load_all_components()
 
 # ======================== AGENT STATE ========================
 class AgentState(TypedDict):
@@ -82,10 +87,8 @@ def router_node(state: AgentState) -> AgentState:
 
 
 def researcher_node(state: AgentState) -> AgentState:
-    vectorstore = get_vectorstore()
     query = state["query"]
     context = ""
-
     if vectorstore:
         docs = vectorstore.similarity_search(query, k=5)
         context = "\n\n".join([d.page_content[:700] for d in docs])
@@ -93,24 +96,23 @@ def researcher_node(state: AgentState) -> AgentState:
     news = ddg_search.run(f"NVIDIA {query} latest news OR earnings OR Blackwell OR Huawei")[:800]
 
     resp = llm.invoke([
-        SystemMessage(content="You are NVIDIA expert researcher. Use RAG context and latest news. Be concise, accurate, and professional."),
+        SystemMessage(content="You are NVIDIA expert researcher. Use provided RAG and news. Be concise and professional."),
         HumanMessage(content=f"Query: {query}\n\nRAG Context:\n{context}\n\nLatest News:\n{news}")
     ]).content
 
     state["response"] = resp
-    state["debug_log"] += "🔎 Researcher completed (RAG + DDG used)\n"
+    state["debug_log"] += "🔎 Researcher completed (RAG + DDG)\n"
     return state
 
 
 def trader_node(state: AgentState) -> AgentState:
-    df, checkpoint = get_model_and_df()
-    if not checkpoint:
+    if not model_checkpoint:
         state["response"] = "❌ Prophet model not available."
         return state
 
     try:
-        model = checkpoint['prophet_model']
-        last_close = checkpoint['last_close']
+        model = model_checkpoint['prophet_model']
+        last_close = model_checkpoint['last_close']
 
         future = model.make_future_dataframe(periods=7, freq='B')
         future['MA7'] = df['Close'].rolling(7).mean().iloc[-1]
@@ -132,7 +134,7 @@ def trader_node(state: AgentState) -> AgentState:
             "⚪ **HOLD** – Monitor closely"
         )
 
-        lines = [f"**{row['ds']}**: ${row['yhat']:.2f}  (range ${row['yhat_lower']:.2f}–${row['yhat_upper']:.2f})" 
+        lines = [f"**{row['ds']}**: ${row['yhat']:.2f}  (range: ${row['yhat_lower']:.2f}–${row['yhat_upper']:.2f})" 
                  for _, row in pred.iterrows()]
 
         state["response"] = f"""**🚀 NVIDIA 7-DAY FORECAST**
@@ -145,7 +147,7 @@ def trader_node(state: AgentState) -> AgentState:
 **Detailed Predictions:**
 """ + "\n".join(lines) + f"""
 
-*Backtested MAPE: {checkpoint.get('backtest_mape', 'N/A'):.2f}%*"""
+*Backtested MAPE: {model_checkpoint.get('backtest_mape', 'N/A'):.2f}%*"""
 
     except Exception as e:
         state["response"] = f"Forecast error: {str(e)}"
@@ -179,9 +181,9 @@ for node in ["researcher", "trader", "general"]:
 
 app = workflow.compile()
 
-# ======================== STREAMLIT UI ========================
+# ======================== UI ========================
 st.title("🚀 NVIDIA AI Assistant – Multi-Agent System")
-st.caption("NTU DSAI Capstone | RAG + Prophet + DuckDuckGo")
+st.caption("NTU DSAI Capstone | Full RAG + Prophet + DuckDuckGo | 2GB Optimized")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -190,7 +192,7 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-if prompt := st.chat_input("Ask anything about NVIDIA (price forecast, news, financials, Blackwell, etc.)"):
+if prompt := st.chat_input("Ask anything about NVIDIA..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -204,7 +206,7 @@ if prompt := st.chat_input("Ask anything about NVIDIA (price forecast, news, fin
                 "next_node": ""
             })
             answer = result.get("response", "Sorry, I couldn't generate an answer.")
-            log = result.get("debug_log", "No debug info")
+            log = result.get("debug_log", "")
 
             st.markdown(answer)
             with st.expander("🔍 Debug Trace"):
@@ -212,12 +214,11 @@ if prompt := st.chat_input("Ask anything about NVIDIA (price forecast, news, fin
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
-# ======================== SIDEBAR ========================
+# Sidebar
 with st.sidebar:
-    st.success("✅ Lazy Loading Active")
-    st.success("✅ MiniLM + CPU Only")
-    st.success("✅ RAG + DDG Ready")
+    st.success("✅ Full Loading (2GB)")
+    st.success("✅ RAG + Prophet + DDG Ready")
     if st.button("Clear Chat"):
         st.session_state.messages = []
         st.rerun()
-    st.caption("Optimized for Render – Upgrade to Standard (2GB) for best performance")
+    st.caption("Running on Standard Instance (2 GB RAM)")
