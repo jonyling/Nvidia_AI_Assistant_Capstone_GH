@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: Nvidia_AI_Assistant
+    runtime: python
+    buildCommand: pip install -r requirements.txt --no-cache-dir
+    startCommand: streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
+    
