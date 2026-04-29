@@ -4,7 +4,7 @@ import pandas as pd
 import joblib
 from dotenv import load_dotenv
 
-# ==================== MEMORY & TELEMETRY OPTIMIZATIONS ====================
+# ==================== OPTIMIZATIONS ====================
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CHROMA_NO_SERVER"] = "true"
 os.environ["CHROMA_ANONYMIZED_TELEMETRY"] = "false"
@@ -34,12 +34,11 @@ from chromadb.config import Settings
 llm = ChatOpenAI(model="gpt-5.4", temperature=0.3, max_tokens=1024)
 ddg_search = DuckDuckGoSearchRun()
 
-# ======================== LOAD EVERYTHING AT STARTUP (2GB Safe) ========================
+# ======================== LOAD COMPONENTS (2GB Safe) ========================
 @st.cache_resource
 def load_all_components():
-    # RAG
     embeddings = HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2",
+        model_name="all-mpnet-base-v2",          # Must match your collection (768 dim)
         model_kwargs={"device": "cpu"}
     )
     client = chromadb.PersistentClient(
@@ -52,7 +51,6 @@ def load_all_components():
         embedding_function=embeddings
     )
 
-    # Data + Model
     df = pd.read_csv(CSV_PATH, skiprows=[1])
     df['Date'] = pd.to_datetime(df['Date'])
     df = df.sort_values('Date').reset_index(drop=True)
@@ -71,32 +69,48 @@ class AgentState(TypedDict):
     next_node: str
 
 
-# ======================== NODES ========================
+# ======================== INTELLIGENT LLM ROUTER ========================
 def router_node(state: AgentState) -> AgentState:
-    q = state["query"].lower()
-    if any(word in q for word in ["predict", "forecast", "price", "7 day", "next week", "tomorrow", "day 7"]):
+    query = state["query"]
+
+    router_prompt = f"""You are an intelligent router for the NVIDIA AI Assistant.
+Available agents:
+- trader: ONLY for direct stock price prediction, 7-day forecast, tomorrow's price, next week price.
+- researcher: For news, financials, strategy, competitors (Huawei, DeepSeek, Ascend), Blackwell, risks, revenue, gross margin, business impact, etc.
+- general: Everything else or simple questions.
+
+Decide the SINGLE best agent for this query. Reply with ONLY one word: trader, researcher, or general.
+
+Query: {query}
+Answer:"""
+
+    decision = llm.invoke([HumanMessage(content=router_prompt)]).content.strip().lower()
+
+    if "trader" in decision:
         state["next_node"] = "trader"
-        state["debug_log"] = "🚦 Router → Trader\n"
-    elif any(word in q for word in ["news", "outlook", "blackwell", "risk", "revenue", "financial", "gross", "huawei", "deepseek", "ascend"]):
+        state["debug_log"] = "🚦 LLM Router → Trader\n"
+    elif "researcher" in decision:
         state["next_node"] = "researcher"
-        state["debug_log"] = "🚦 Router → Researcher\n"
+        state["debug_log"] = "🚦 LLM Router → Researcher\n"
     else:
         state["next_node"] = "general"
-        state["debug_log"] = "🚦 Router → General\n"
+        state["debug_log"] = "🚦 LLM Router → General\n"
+
     return state
 
 
+# ======================== NODES ========================
 def researcher_node(state: AgentState) -> AgentState:
     query = state["query"]
     context = ""
     if vectorstore:
         docs = vectorstore.similarity_search(query, k=5)
-        context = "\n\n".join([d.page_content[:700] for d in docs])
+        context = "\n\n".join([d.page_content[:800] for d in docs])
 
-    news = ddg_search.run(f"NVIDIA {query} latest news OR earnings OR Blackwell OR Huawei")[:800]
+    news = ddg_search.run(f"NVIDIA {query} latest news OR earnings OR Blackwell OR Huawei OR DeepSeek")[:800]
 
     resp = llm.invoke([
-        SystemMessage(content="You are NVIDIA expert researcher. Use provided RAG and news. Be concise and professional."),
+        SystemMessage(content="You are NVIDIA expert researcher. Use RAG context and latest news. Be concise, factual and professional."),
         HumanMessage(content=f"Query: {query}\n\nRAG Context:\n{context}\n\nLatest News:\n{news}")
     ]).content
 
@@ -134,7 +148,7 @@ def trader_node(state: AgentState) -> AgentState:
             "⚪ **HOLD** – Monitor closely"
         )
 
-        lines = [f"**{row['ds']}**: ${row['yhat']:.2f}  (range: ${row['yhat_lower']:.2f}–${row['yhat_upper']:.2f})" 
+        lines = [f"**{row['ds']}**: ${row['yhat']:.2f} (range: ${row['yhat_lower']:.2f}–${row['yhat_upper']:.2f})" 
                  for _, row in pred.iterrows()]
 
         state["response"] = f"""**🚀 NVIDIA 7-DAY FORECAST**
@@ -183,7 +197,7 @@ app = workflow.compile()
 
 # ======================== UI ========================
 st.title("🚀 NVIDIA AI Assistant – Multi-Agent System")
-st.caption("NTU DSAI Capstone | Full RAG + Prophet + DuckDuckGo | 2GB Optimized")
+st.caption("NTU DSAI Capstone | Intelligent LLM Router + Full RAG + Prophet + DuckDuckGo | 2GB Optimized")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -216,8 +230,8 @@ if prompt := st.chat_input("Ask anything about NVIDIA..."):
 
 # Sidebar
 with st.sidebar:
-    st.success("✅ Full Loading (2GB)")
-    st.success("✅ RAG + Prophet + DDG Ready")
+    st.success("✅ Intelligent LLM Router")
+    st.success("✅ Full RAG + Prophet + DDG Ready")
     if st.button("Clear Chat"):
         st.session_state.messages = []
         st.rerun()
