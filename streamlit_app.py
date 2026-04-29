@@ -5,6 +5,12 @@ import joblib
 from dotenv import load_dotenv
 import gc
 
+os.environ["CHROMA_ANONYMIZED_TELEMETRY"] = "false"
+os.environ["OTEL_SDK_DISABLED"] = "true"          # Disable OpenTelemetry entirely
+os.environ["CHROMA_OPEN_TELEMETRY__DISABLED"] = "true"
+# Then your existing os.environ lines...
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["CHROMA_NO_SERVER"] = "true"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CHROMA_NO_SERVER"] = "true"
 
@@ -35,17 +41,28 @@ ddg_search = DuckDuckGoSearchRun()   # very light
 @st.cache_resource(show_spinner=False)
 def get_vectorstore():
     try:
+        from chromadb.config import Settings
+        client_settings = Settings(
+            allow_reset=True,
+            anonymized_telemetry=False
+        )
         embeddings = HuggingFaceEmbeddings(
             model_name="all-MiniLM-L6-v2",
             model_kwargs={"device": "cpu"}
         )
         import chromadb
-        from chromadb.config import Settings
-        client = chromadb.PersistentClient(path=DB_PATH, settings=Settings(allow_reset=True))
-        vs = Chroma(client=client, collection_name="nvidia_annual_reports_2014_2025", embedding_function=embeddings)
+        client = chromadb.PersistentClient(
+            path=DB_PATH, 
+            settings=client_settings
+        )
+        vs = Chroma(
+            client=client,
+            collection_name="nvidia_annual_reports_2014_2025",
+            embedding_function=embeddings
+        )
         return vs
     except Exception as e:
-        st.sidebar.error(f"RAG failed: {str(e)[:80]}")
+        st.sidebar.error(f"RAG failed: {str(e)[:100]}")
         return None
 
 
