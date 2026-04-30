@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 import joblib
 import pandas as pd
 from datetime import datetime
+from typing import TypedDict, Annotated
+import operator
 
 from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
@@ -19,9 +21,9 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 bot = telebot.TeleBot(BOT_TOKEN)
-llm = ChatOpenAI(model="gpt-5.4", temperature=0.3)
+llm = ChatOpenAI(model="gpt-5.4", temperature=0.3, max_tokens=1000)
 
-# Load components
+# ======================== LOAD COMPONENTS ========================
 vectorstore = None
 try:
     embeddings = HuggingFaceEmbeddings(model_name="all-mpnet-base-v2", model_kwargs={"device": "cpu"})
@@ -37,31 +39,22 @@ ddg_search = DuckDuckGoSearchRun()
 checkpoint = joblib.load("nvidia_price_model.pkl")
 prophet_model = checkpoint['prophet_model']
 last_close = checkpoint['last_close']
+
 df = pd.read_csv("nvda_2014_to_2026.csv", skiprows=[1])
 df['Date'] = pd.to_datetime(df['Date'])
 df = df.sort_values('Date').reset_index(drop=True)
 
-print("✅ Nvidia_bot fully loaded")
+print("✅ All components loaded")
 
-# ======================== ROUTER ========================
-def get_router_decision(query: str):
-    prompt = f"""Classify this query:
-- trader: pure short-term price forecast
-- researcher: qualitative / news / technology / competition
-- hybrid: price prediction + qualitative analysis (e.g. impact of Huawei/DeepSeek on price)
-
-Query: {query}
-Reply with ONLY one word: trader, researcher or hybrid"""
-    try:
-        decision = llm.invoke([HumanMessage(content=prompt)]).content.strip().lower()
-        if "hybrid" in decision:
-            return "hybrid"
-        return "trader" if "trader" in decision else "researcher"
-    except:
-        return "researcher"
+# ======================== AGENT STATE ========================
+class AgentState(TypedDict):
+    query: str
+    response: str
+    debug_log: Annotated[str, operator.add]
+    next_node: str  # trader, researcher, hybrid, general
 
 # ======================== NODES ========================
-def trader_forecast() -> str:
+def trader_node(state: AgentState) -> AgentState:
     try:
         future = prophet_model.make_future_dataframe(periods=7, freq='B')
         future['MA7'] = df['Close'].rolling(7).mean().iloc[-1]
@@ -73,77 +66,131 @@ def trader_forecast() -> str:
         pred = forecast.tail(7)[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
         pred['ds'] = pred['ds'].dt.strftime('%Y-%m-%d')
 
-        final_pred = pred['yhat'].iloc[-1]
-        upside = (final_pred / last_close - 1) * 100
-
+        final = pred['yhat'].iloc[-1]
+        upside = (final / last_close - 1) * 100
         rec = "🟢 STRONG BUY" if upside > 4 else "🟡 BUY" if upside > 1.8 else "⚪ HOLD" if upside > -5 else "🔴 CAUTION"
 
         lines = [f"{row['ds']}: **${row['yhat']:.2f}** (range: ${row['yhat_lower']:.2f}–${row['yhat_upper']:.2f})" 
                 for _, row in pred.iterrows()]
 
-        return f"""**🚀 NVIDIA 7-DAY FORECAST**
+        state["response"] = f"""**🚀 NVIDIA 7-DAY FORECAST**
 **Current Price:** ${last_close:.2f}
-**Day 7 Expected:** **${final_pred:.2f}** ({upside:+.1f}%)
+**Day 7 Expected:** **${final:.2f}** ({upside:+.1f}%)
 **Recommendation:** {rec}
 
 **Full Predictions:**
 """ + "\n".join(lines)
     except Exception as e:
-        return f"Forecast error: {str(e)}"
+        state["response"] = f"Trader error: {str(e)}"
+    state["debug_log"] += "📈 Trader completed\n"
+    return state
 
 
-def researcher_answer(query: str) -> str:
+def researcher_node(state: AgentState) -> AgentState:
+    query = state["query"]
     context = ""
     if vectorstore:
         docs = vectorstore.similarity_search(query, k=5)
         context = "\n\n".join([d.page_content[:700] for d in docs])
 
-    news = ddg_search.run(f"NVIDIA {query} latest news OR Blackwell OR Huawei OR DeepSeek OR World Model")[:800]
+    news = ddg_search.run(f"NVIDIA {query} latest OR Blackwell OR Huawei OR DeepSeek")[:800]
 
     resp = llm.invoke([
-        SystemMessage(content="You are a senior NVIDIA strategy analyst. Be insightful and balanced."),
-        HumanMessage(content=f"Query: {query}\n\nRAG Context:\n{context}\n\nLatest News:\n{news}")
+        SystemMessage(content="Senior NVIDIA strategy analyst. Be insightful."),
+        HumanMessage(content=f"Query: {query}\nRAG:\n{context}\nNews:\n{news}")
     ]).content
-    return resp
+
+    state["response"] = resp
+    state["debug_log"] += "🔎 Researcher completed\n"
+    return state
 
 
-def hybrid_answer(query: str) -> str:
-    forecast = trader_forecast()
-    analysis = researcher_answer(query)
-    return f"{forecast}\n\n**Qualitative Analysis:**\n{analysis}"
+def hybrid_node(state: AgentState) -> AgentState:
+    trader_result = trader_node(state.copy())
+    researcher_result = researcher_node(state.copy())
+
+    state["response"] = f"""{trader_result.get("response", "")}
+
+**Qualitative Analysis & Market Context:**
+{researcher_result.get("response", "")}"""
+    state["debug_log"] += "🔀 Hybrid (Trader + Researcher) completed\n"
+    return state
+
+
+def general_node(state: AgentState) -> AgentState:
+    resp = llm.invoke([SystemMessage(content="Helpful NVIDIA assistant."), HumanMessage(content=state["query"])]).content
+    state["response"] = resp
+    state["debug_log"] += "💬 General completed\n"
+    return state
+
+
+# ======================== INTELLIGENT ROUTER ========================
+def router_node(query: str) -> str:
+    prompt = f"""Analyze this query and decide the best execution strategy.
+You can choose:
+- trader: only quantitative price forecast
+- researcher: only qualitative / news / RAG analysis
+- hybrid: combine both Trader (ML forecast) + Researcher (qualitative context)
+- general: simple answer
+
+Query: {query}
+Reply with ONLY one word: trader, researcher, hybrid or general."""
+
+    try:
+        decision = llm.invoke([HumanMessage(content=prompt)]).content.strip().lower()
+        if "hybrid" in decision:
+            return "hybrid"
+        elif "trader" in decision:
+            return "trader"
+        elif "researcher" in decision:
+            return "researcher"
+        else:
+            return "general"
+    except:
+        return "hybrid"  # safe default
 
 
 # ======================== BOT ========================
 @bot.message_handler(commands=['start', 'help'])
 def welcome(message):
-    bot.reply_to(message, "✅ **NVIDIA Bot is online!**\nAsk anything about price forecasts or technology/competition impact.")
+    bot.reply_to(message, "✅ **NVIDIA Bot is online!**\nAsk anything — I can mix forecast + analysis.")
 
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     bot.send_chat_action(message.chat.id, 'typing')
     query = message.text.strip()
 
-    route = get_router_decision(query)
+    route = router_node(query)
+
+    state = {"query": query, "response": "", "debug_log": "", "next_node": route}
 
     if route == "hybrid":
-        reply = hybrid_answer(query)
+        final_state = hybrid_node(state)
     elif route == "trader":
-        reply = trader_forecast()
+        final_state = trader_node(state)
+    elif route == "researcher":
+        final_state = researcher_node(state)
     else:
-        reply = researcher_answer(query)
+        final_state = general_node(state)
 
-    bot.reply_to(message, reply)
+    bot.reply_to(message, final_state["response"])
 
 
-# ======================== DAILY ALERT ========================
-def send_daily_alert():
-    forecast = trader_forecast()
-    bot.send_message(CHAT_ID, f"🚨 **NVIDIA DAILY ALERT** {datetime.now().strftime('%Y-%m-%d')}\n\n{forecast}")
+# ======================== HOURLY ALERT ========================
+def hourly_alert():
+    query = "latest Nvidia news and price outlook"
+    state = {"query": query, "response": "", "debug_log": "", "next_node": "hybrid"}
+    final = hybrid_node(state)
+    try:
+        bot.send_message(CHAT_ID, f"🕒 **HOURLY NVIDIA UPDATE** {datetime.now().strftime('%H:%M')}\n\n{final['response']}")
+        print("✅ Hourly alert sent")
+    except:
+        pass
 
 if __name__ == "__main__":
-    print("🚀 Nvidia_bot with Hybrid Router started...")
-    send_daily_alert()
-    schedule.every(60).minutes.do(send_daily_alert)
+    print("🚀 Nvidia_bot with Full Multi-Agent System (Hybrid Router) started...")
+    hourly_alert()
+    schedule.every(60).minutes.do(hourly_alert)
 
     while True:
         try:
